@@ -1,8 +1,9 @@
 name: Validate (PR)
 
-# Runs on every pull request into main. Performs a CHECK-ONLY validation
-# (nothing is actually saved to the org) plus runs Apex local tests, so a PR
-# cannot be merged unless it would deploy cleanly.
+# Runs on every pull request into main. Two parallel gates:
+#   1. lint     - ESLint (LWC/Aura JS) + PMD Apex static analysis
+#   2. validate - check-only deploy + Apex tests (nothing is saved to the org)
+# Both must pass before the PR can merge.
 
 on:
   pull_request:
@@ -10,6 +11,9 @@ on:
     paths:
       - "force-app/**"
       - ".github/workflows/**"
+      - "package.json"
+      - "package-lock.json"
+      - "eslint.config.js"
 
 # Cancel an in-progress run if the PR is updated again.
 concurrency:
@@ -17,7 +21,50 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lint:
+    name: Lint (ESLint + PMD)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      # ESLint uses the project's own eslint.config.js (LWC + Aura recommended rules).
+      - name: ESLint (LWC / Aura JavaScript)
+        run: npm run lint
+
+      - name: Set up Java (required by PMD)
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Install Salesforce CLI + Code Analyzer
+        run: |
+          npm install --global @salesforce/cli@latest
+          sf plugins install code-analyzer@latest
+
+      # Fails the job when PMD finds High (2) or Critical (1) severity issues.
+      # Lower severities are printed but do not block. Tune --severity-threshold
+      # (1=Critical … 5=Info) to change strictness.
+      - name: PMD (Apex static analysis) — fail on High+ severity
+        run: |
+          sf code-analyzer run \
+            --workspace force-app \
+            --rule-selector pmd \
+            --severity-threshold 2 \
+            --view detail
+
   validate:
+    name: Validate deploy
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source
@@ -44,3 +91,65 @@ jobs:
             --test-level RunSpecifiedTests \
             --tests AccountControllerTest \
             --target-org target
+
+  claude-review:
+    name: Claude PR review
+    runs-on: ubuntu-latest
+    # Advisory only: this job posts an AI review comment but never blocks the PR.
+    continue-on-error: true
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Claude Code
+        run: npm install --global @anthropic-ai/claude-code
+
+      - name: Run Claude headless review of the PR diff
+        env:
+          # Uses your Claude subscription (Pro/Max) via a long-lived OAuth token
+          # generated locally with `claude setup-token` — no API token charges.
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git diff "$BASE_SHA...$HEAD_SHA" > pr.diff
+          PROMPT=$(cat <<'EOF'
+          You are reviewing a Salesforce DX pull request. Base your review ONLY on
+          the unified diff provided on stdin — do not assume anything not shown.
+          Focus on: Apex security (CRUD/FLS, with/without sharing), governor-limit
+          and bulkification issues, test quality/coverage, and LWC/JS best practices.
+          Respond in GitHub-flavored markdown: start with a one-line overall verdict,
+          then a short bulleted list of findings, each tagged [High]/[Medium]/[Low].
+          If nothing notable, say so briefly. Keep it under ~250 words.
+          EOF
+          )
+          # Headless, non-interactive, no tools — pure review of the piped diff.
+          cat pr.diff | claude -p "$PROMPT" \
+            --model claude-sonnet-4-6 \
+            --allowed-tools "" \
+            --output-format text > review.md
+          echo "----- review -----"
+          cat review.md
+
+      - name: Post review as a PR comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "## 🤖 Claude PR review"
+            echo
+            cat review.md
+            echo
+            echo "_Advisory review — generated headlessly with \`claude -p\`. Not a merge gate._"
+          } > comment.md
+          gh pr comment "${{ github.event.pull_request.number }}" --body-file comment.md
