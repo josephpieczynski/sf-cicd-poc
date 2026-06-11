@@ -1,0 +1,41 @@
+name: Deploy (main)
+
+# Runs after a pull request is merged (push to main). Performs a real deploy
+# of force-app to the target org and runs Apex local tests.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "force-app/**"
+
+# Never run two deploys to the same org at once.
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Salesforce CLI
+        run: npm install --global @salesforce/cli@latest
+
+      - name: Authenticate to target org
+        shell: bash
+        run: |
+          echo "${{ secrets.SFDX_AUTH_URL }}" > ./auth-url.txt
+          sf org login sfdx-url --sfdx-url-file ./auth-url.txt --alias target --set-default
+          rm -f ./auth-url.txt
+
+      # See validate.yml for why RunSpecifiedTests is used instead of RunLocalTests.
+      - name: Deploy to org + run tests
+        run: |
+          sf project deploy start \
+            --source-dir force-app \
+            --test-level RunSpecifiedTests \
+            --tests AccountControllerTest \
+            --target-org target
