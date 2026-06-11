@@ -1,0 +1,46 @@
+name: Validate (PR)
+
+# Runs on every pull request into main. Performs a CHECK-ONLY validation
+# (nothing is actually saved to the org) plus runs Apex local tests, so a PR
+# cannot be merged unless it would deploy cleanly.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "force-app/**"
+      - ".github/workflows/**"
+
+# Cancel an in-progress run if the PR is updated again.
+concurrency:
+  group: validate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Salesforce CLI
+        run: npm install --global @salesforce/cli@latest
+
+      - name: Authenticate to target org
+        shell: bash
+        run: |
+          echo "${{ secrets.SFDX_AUTH_URL }}" > ./auth-url.txt
+          sf org login sfdx-url --sfdx-url-file ./auth-url.txt --alias target --set-default
+          rm -f ./auth-url.txt
+
+      # RunSpecifiedTests validates only the tests for the metadata in this repo.
+      # (The target org has pre-existing unrelated tests/coverage debt, so
+      # RunLocalTests would fail the pipeline for reasons outside this project.
+      # In a fuller pipeline you would compute this test list from the diff.)
+      - name: Validate deploy (check-only) + run tests
+        run: |
+          sf project deploy validate \
+            --source-dir force-app \
+            --test-level RunSpecifiedTests \
+            --tests AccountControllerTest \
+            --target-org target
