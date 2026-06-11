@@ -24,9 +24,15 @@ jobs:
   lint:
     name: Lint (ESLint + PMD)
     runs-on: ubuntu-latest
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
+        with:
+          # Full history so we can diff against the PR base.
+          fetch-depth: 0
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -37,9 +43,24 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # ESLint uses the project's own eslint.config.js (LWC + Aura recommended rules).
-      - name: ESLint (LWC / Aura JavaScript)
-        run: npm run lint
+      # Compute the files changed in THIS PR and split them per linter.
+      # --diff-filter=ACMR ignores deleted files (nothing to lint).
+      - name: Determine changed files
+        run: |
+          git diff --name-only --diff-filter=ACMR "$BASE_SHA...$HEAD_SHA" > changed.txt
+          echo "Files changed in this PR:"; cat changed.txt
+          grep -E '/(lwc|aura)/.*\.js$' changed.txt > eslint_files.txt || true
+          grep -E '\.(cls|trigger)$'    changed.txt > pmd_files.txt    || true
+
+      # ESLint runs only on changed LWC/Aura JS, using the project's eslint.config.js.
+      - name: ESLint (changed LWC / Aura JS only)
+        run: |
+          if [ ! -s eslint_files.txt ]; then
+            echo "No changed LWC/Aura JS files — skipping ESLint."
+            exit 0
+          fi
+          echo "Linting:"; cat eslint_files.txt
+          npx eslint $(cat eslint_files.txt)
 
       - name: Set up Java (required by PMD)
         uses: actions/setup-java@v4
@@ -52,13 +73,20 @@ jobs:
           npm install --global @salesforce/cli@latest
           sf plugins install code-analyzer@latest
 
-      # Fails the job when PMD finds High (2) or Critical (1) severity issues.
-      # Lower severities are printed but do not block. Tune --severity-threshold
+      # PMD analyzes only the changed Apex files (--target), with force-app kept as
+      # context (--workspace). Fails on High (2)+ severity. Tune --severity-threshold
       # (1=Critical … 5=Info) to change strictness.
-      - name: PMD (Apex static analysis) — fail on High+ severity
+      - name: PMD (changed Apex only) — fail on High+ severity
         run: |
+          if [ ! -s pmd_files.txt ]; then
+            echo "No changed Apex files — skipping PMD."
+            exit 0
+          fi
+          echo "Analyzing:"; cat pmd_files.txt
+          TARGETS=$(paste -sd, pmd_files.txt)
           sf code-analyzer run \
             --workspace force-app \
+            --target "$TARGETS" \
             --rule-selector pmd \
             --severity-threshold 2 \
             --view detail
